@@ -538,6 +538,10 @@ func (suite *OvnClientTestSuite) Test_sgRuleNoACL() {
 	suite.testSgRuleNoACL()
 }
 
+func (suite *OvnClientTestSuite) Test_newAnpACLMatch() {
+	suite.testNewAnpACLMatch()
+}
+
 /* logical_router_policy unit test */
 func (suite *OvnClientTestSuite) Test_AddLogicalRouterPolicy() {
 	suite.testAddLogicalRouterPolicy()
