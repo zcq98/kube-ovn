@@ -504,7 +504,7 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 	}
 	// add new policies
 	for _, item := range policyRouteNeedAdd {
-		klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, externalID %v", c.config.ClusterRouter, item.Match, string(item.Action), item.NextHopIP, externalIDs)
+		klog.Infof("add policy route for router: %s, match %s, action %s, nexthop %s, externalID %v", vpc.Name, item.Match, string(item.Action), item.NextHopIP, externalIDs)
 		if err = c.OVNNbClient.AddLogicalRouterPolicy(vpc.Name, item.Priority, item.Match, string(item.Action), []string{item.NextHopIP}, externalIDs); err != nil {
 			klog.Errorf("add policy route to vpc %s failed, %v", vpc.Name, err)
 			return err
@@ -601,6 +601,13 @@ func (c *Controller) handleAddOrUpdateVpc(key string) error {
 						klog.Errorf("failed to reconcile del vpc %q normal static route", vpc.Name)
 						return err
 					}
+				}
+			} else {
+				// auto add normal type static route, if not use ecmp based bfd and just one externel subnet
+				klog.Infof("add normal external static/policy route for enabling external vpc %s", vpc.Name)
+				if err := c.reconcileCustomVpcRoute(vpc.Name); err != nil {
+					klog.Errorf("failed to reconcile vpc %q bfd static route", vpc.Name)
+					return err
 				}
 			}
 			if cachedVpc.Spec.ExtraExternalSubnets != nil {
@@ -1334,5 +1341,288 @@ func (c *Controller) updateVpcAddExternalStatus(key string, addExternalStatus bo
 		return err
 	}
 
+	return nil
+}
+
+func (c *Controller) reconcileCustomVpcRoute(vpcName string) error {
+	/*
+		1. vpc disable bfd and subnet disable ecmp and no extra external subnet
+			static route:
+				dst 0.0.0.0 nexthop is external underlay switch gw
+
+		2. vpc disable bfd and subnet disable ecmp with extra external subnets(e.g. extra1, extra2)
+			policy route:
+				prio 29000 match: "ip4.src == ${defaultexternalsubnet name}.{vpc name}"	reroute default external subnet gw
+				prio 29000 match: "ip4.src == ${extra1 name}.{vpc name}"	reroute extra1 gw
+				prio 29000 match: "ip4.src == ${extra2 name}.{vpc name}"	reroute extra2 gw
+	*/
+
+	// handle static route for vpc which disables bfd and subnet disables ecmp and no extra external subnet
+	defaultExternalSubnet, err := c.subnetsLister.Get(c.config.ExternalGatewaySwitch)
+	if err != nil {
+		klog.Errorf("failed to get default external switch subnet %s: %v", c.config.ExternalGatewaySwitch, err)
+		return err
+	}
+	gatewayV4, gatewayV6 := util.SplitStringIP(defaultExternalSubnet.Spec.Gateway)
+	cachedVpc, err := c.vpcsLister.Get(vpcName)
+	if err != nil {
+		if k8serrors.IsNotFound(err) {
+			return nil
+		}
+		klog.Errorf("failed to get vpc %s, %v", vpcName, err)
+		return err
+	}
+
+	staticRtbs := c.getRouteTablesByVpc(cachedVpc)
+	staticRouteTotal := len(cachedVpc.Spec.StaticRoutes) + len(staticRtbs)*2
+	staticRoutes := make([]*kubeovnv1.StaticRoute, 0, staticRouteTotal)
+	v4Exist, v6Exist := false, false
+	needUpdateStatic := false
+	for _, staticRtb := range staticRtbs {
+		for _, route := range staticRtb {
+			if route.Policy == kubeovnv1.PolicyDst &&
+				route.NextHopIP == gatewayV4 &&
+				route.CIDR == "0.0.0.0/0" {
+				if cachedVpc.Spec.ExtraExternalSubnets == nil {
+					v4Exist = true
+				} else {
+					needUpdateStatic = true
+					continue
+				}
+			}
+			if route.Policy == kubeovnv1.PolicyDst &&
+				route.NextHopIP == gatewayV6 &&
+				route.CIDR == "::/0" {
+				if cachedVpc.Spec.ExtraExternalSubnets == nil {
+					v6Exist = true
+				} else {
+					needUpdateStatic = true
+					continue
+				}
+			}
+			if route.ECMPMode == "" {
+				// filter ecmp bfd route
+				staticRoutes = append(staticRoutes, route)
+			}
+		}
+	}
+
+	if cachedVpc.Spec.ExtraExternalSubnets == nil && !v4Exist && gatewayV4 != "" {
+		klog.Infof("add normal static route v4 nexthop %s", gatewayV4)
+		staticRoutes = append(staticRoutes, &kubeovnv1.StaticRoute{
+			Policy:     kubeovnv1.PolicyDst,
+			CIDR:       "0.0.0.0/0",
+			NextHopIP:  gatewayV4,
+			RouteTable: util.MainRouteTable,
+		})
+		needUpdateStatic = true
+	}
+
+	if cachedVpc.Spec.ExtraExternalSubnets == nil && !v6Exist && gatewayV6 != "" {
+		klog.Infof("add normal static route v6 nexthop %s", gatewayV6)
+		staticRoutes = append(staticRoutes, &kubeovnv1.StaticRoute{
+			Policy:     kubeovnv1.PolicyDst,
+			CIDR:       "::/0",
+			NextHopIP:  gatewayV6,
+			RouteTable: util.MainRouteTable,
+		})
+		needUpdateStatic = true
+	}
+
+	// handle policy route for multiple external subnets
+	policyRtbs := cachedVpc.Spec.PolicyRoutes
+	v4Exist, v6Exist = false, false
+	needUpdatePolicy := false
+
+	if cachedVpc.Spec.ExtraExternalSubnets != nil {
+		sort.Strings(cachedVpc.Spec.ExtraExternalSubnets)
+	}
+
+	klog.Infof("Spec %v, Status %v", cachedVpc.Spec.ExtraExternalSubnets, cachedVpc.Status.ExtraExternalSubnets)
+	externalSubnets := make([]string, 0, len(cachedVpc.Spec.ExtraExternalSubnets))
+	externalSubnets = append(externalSubnets, cachedVpc.Spec.ExtraExternalSubnets...)
+	externalSubnets = append(externalSubnets, c.config.ExternalGatewaySwitch)
+	if !reflect.DeepEqual(cachedVpc.Spec.ExtraExternalSubnets, cachedVpc.Status.ExtraExternalSubnets) {
+		for _, subnet := range cachedVpc.Status.ExtraExternalSubnets {
+			if !slices.Contains(externalSubnets, subnet) {
+				externalSubnets = append(externalSubnets, subnet)
+			}
+		}
+		addressSetV4 := make(map[string][]string)
+		addressSetV6 := make(map[string][]string)
+		for _, subnet := range externalSubnets {
+			externalSubnet, err := c.subnetsLister.Get(subnet)
+			if err != nil {
+				klog.Errorf("failed to get extra external switch subnet %s: %v", subnet, err)
+				continue
+			}
+			gatewayV4, gatewayV6 := util.SplitStringIP(externalSubnet.Spec.Gateway)
+			pgName := strings.ReplaceAll(fmt.Sprintf("%s.%s", externalSubnet.Name, vpcName), "-", ".")
+			var policyRoutes []*kubeovnv1.PolicyRoute
+			for index, policyRoute := range policyRtbs {
+				if policyRoute.Priority == util.GatewayRouterPolicyPriority &&
+					policyRoute.Match == fmt.Sprintf("ipv4.src == $%s_ipv4", pgName) &&
+					policyRoute.Action == kubeovnv1.PolicyRouteActionReroute &&
+					policyRoute.NextHopIP == gatewayV4 {
+					if cachedVpc.Spec.ExtraExternalSubnets != nil && (slices.Contains(cachedVpc.Spec.ExtraExternalSubnets, subnet) || subnet == c.config.ExternalGatewaySwitch) {
+						policyRoutes = append(policyRoutes, policyRoute)
+						v4Exist = true
+					} else {
+						needUpdatePolicy = true
+					}
+					continue
+				}
+				if policyRoute.Priority == util.GatewayRouterPolicyPriority &&
+					policyRoute.Match == fmt.Sprintf("ipv6.src == $%s_ipv6", pgName) &&
+					policyRoute.Action == kubeovnv1.PolicyRouteActionReroute &&
+					policyRoute.NextHopIP == gatewayV6 {
+					if cachedVpc.Spec.ExtraExternalSubnets != nil && (slices.Contains(cachedVpc.Spec.ExtraExternalSubnets, subnet) || subnet == c.config.ExternalGatewaySwitch) {
+						policyRoutes = append(policyRoutes, policyRoute)
+						v6Exist = true
+					} else {
+						policyRtbs = append(policyRtbs[:index], policyRtbs[index+1:]...)
+						needUpdatePolicy = true
+					}
+					continue
+				}
+				policyRoutes = append(policyRoutes, policyRoute)
+			}
+			policyRtbs = policyRoutes
+			if cachedVpc.Spec.ExtraExternalSubnets != nil && !v4Exist && gatewayV4 != "" && (slices.Contains(cachedVpc.Spec.ExtraExternalSubnets, subnet) || subnet == c.config.ExternalGatewaySwitch) {
+				klog.Infof("add normal policy route v4 nexthop %s", gatewayV4)
+				policyRtbs = append(policyRtbs, &kubeovnv1.PolicyRoute{
+					Priority:  util.GatewayRouterPolicyPriority,
+					Match:     fmt.Sprintf("ipv4.src == $%s_ipv4", pgName),
+					Action:    kubeovnv1.PolicyRouteActionReroute,
+					NextHopIP: gatewayV4,
+				})
+				needUpdatePolicy = true
+			}
+			if cachedVpc.Spec.ExtraExternalSubnets != nil && !v6Exist && gatewayV6 != "" && (slices.Contains(cachedVpc.Spec.ExtraExternalSubnets, subnet) || subnet == c.config.ExternalGatewaySwitch) {
+				klog.Infof("add normal policy route v6 nexthop %s", gatewayV6)
+				policyRtbs = append(policyRtbs, &kubeovnv1.PolicyRoute{
+					Priority:  util.GatewayRouterPolicyPriority,
+					Match:     fmt.Sprintf("ipv6.src == $%s_ipv6", pgName),
+					Action:    kubeovnv1.PolicyRouteActionReroute,
+					NextHopIP: gatewayV6,
+				})
+				needUpdatePolicy = true
+			}
+			klog.Infof("subnet: %s, policyRoutes: %v", subnet, policyRtbs)
+
+			if cachedVpc.Spec.ExtraExternalSubnets != nil && (slices.Contains(cachedVpc.Spec.ExtraExternalSubnets, subnet) || subnet == c.config.ExternalGatewaySwitch) {
+				if gatewayV4 != "" {
+					if err := c.OVNNbClient.CreateAddressSet(fmt.Sprintf("%s_ip4", pgName), map[string]string{logicalRouterKey: vpcName, logicalSwitchKey: defaultExternalSubnet.Name, extraExternalKey: "true"}); err != nil {
+						klog.Errorf("failed to create extra external subnet port group %s for subnet %s and vpc %s: %v", pgName, subnet, vpcName, err)
+						return err
+					}
+				}
+				if gatewayV6 != "" {
+					if err := c.OVNNbClient.CreateAddressSet(fmt.Sprintf("%s_ip6", pgName), map[string]string{logicalRouterKey: vpcName, logicalSwitchKey: defaultExternalSubnet.Name, extraExternalKey: "true"}); err != nil {
+						klog.Errorf("failed to create extra external subnet port group %s for subnet %s and vpc %s: %v", pgName, subnet, vpcName, err)
+						return err
+					}
+				}
+				eips, err := c.ovnEipsLister.List(labels.SelectorFromSet(labels.Set{
+					util.VpcAnnotation:   vpcName,
+					util.SubnetNameLabel: subnet,
+				}))
+				if err != nil {
+					if !k8serrors.IsNotFound(err) {
+						klog.Error(err)
+						return err
+					}
+				}
+				klog.Infof("eips: %v", eips)
+				for _, eip := range eips {
+					klog.Infof("eip: %v", eip.Name)
+					klog.Infof("eip status: %v", eip.Status.Nat)
+					if eip.Status.Nat == util.FipUsingEip {
+						fips, err := c.ovnFipsLister.List(labels.SelectorFromSet(labels.Set{
+							util.EipV4IpLabel: eip.Labels[util.EipV4IpLabel],
+						}))
+						if err != nil {
+							if !k8serrors.IsNotFound(err) {
+								klog.Error(err)
+								return err
+							}
+						}
+						klog.Infof("fips: %v", fips)
+						for _, fip := range fips {
+							if fip.Status.V4Ip != "" {
+								klog.Infof("fip.Status.V4Ip: %s", fip.Status.V4Ip)
+								addressSetV4[pgName] = append(addressSetV4[pgName], fip.Status.V4Ip)
+							}
+						}
+					}
+
+					if eip.Status.Nat == util.SnatUsingEip {
+						snats, err := c.ovnSnatRulesLister.List(labels.SelectorFromSet(labels.Set{
+							util.EipV4IpLabel: eip.Labels[util.EipV4IpLabel],
+						}))
+						if err != nil {
+							if !k8serrors.IsNotFound(err) {
+								klog.Error(err)
+								return err
+							}
+						}
+						for _, snat := range snats {
+							if snat.Status.V4IpCidr != "" {
+								addressSetV4[pgName] = append(addressSetV4[pgName], snat.Status.V4IpCidr)
+							}
+						}
+					}
+				}
+			} else {
+				if gatewayV4 != "" {
+					if err := c.OVNNbClient.DeleteAddressSet(fmt.Sprintf("%s_ip4", pgName)); err != nil {
+						klog.Errorf("failed to create extra external subnet port group %s for subnet %s and vpc %s: %v", pgName, defaultExternalSubnet.Name, vpcName, err)
+						return err
+					}
+				}
+				if gatewayV6 != "" {
+					if err := c.OVNNbClient.DeleteAddressSet(fmt.Sprintf("%s_ip6", pgName)); err != nil {
+						klog.Errorf("failed to create extra external subnet port group %s for subnet %s and vpc %s: %v", pgName, defaultExternalSubnet.Name, vpcName, err)
+						return err
+					}
+				}
+			}
+		}
+		klog.Infof("addressSetV4: %v", addressSetV4)
+		for pgName := range addressSetV4 {
+			klog.Infof("pgName: %s", pgName)
+			if err := c.OVNNbClient.AddressSetUpdateAddress(fmt.Sprintf("%s_ip4", pgName), addressSetV4[pgName]...); err != nil {
+				klog.Errorf("failed to create extra external subnet port group %s for subnet %s and vpc %s: %v", pgName, defaultExternalSubnet.Name, vpcName, err)
+				return err
+			}
+		}
+		klog.Infof("addressSetV6: %v", addressSetV6)
+		for pgName := range addressSetV6 {
+			klog.Infof("pgName: %s", pgName)
+			if err := c.OVNNbClient.AddressSetUpdateAddress(fmt.Sprintf("%s_ip4", pgName), addressSetV6[pgName]...); err != nil {
+				klog.Errorf("failed to create extra external subnet port group %s for subnet %s and vpc %s: %v", pgName, defaultExternalSubnet.Name, vpcName, err)
+				return err
+			}
+		}
+	}
+
+	vpc := cachedVpc.DeepCopy()
+	if needUpdateStatic || needUpdatePolicy {
+		if needUpdateStatic {
+			vpc.Spec.StaticRoutes = staticRoutes
+		}
+		if needUpdatePolicy {
+			vpc.Spec.PolicyRoutes = policyRtbs
+			klog.Infof("AllPolicyRoutes: %v", policyRtbs)
+		}
+		if vpc, err = c.config.KubeOvnClient.KubeovnV1().Vpcs().Update(context.Background(), vpc, metav1.UpdateOptions{}); err != nil {
+			klog.Errorf("failed to update vpc spec static route %s, %v", vpc.Name, err)
+			return err
+		}
+		if err = c.patchVpcBfdStatus(vpc.Name); err != nil {
+			klog.Errorf("failed to patch vpc %s, %v", vpc.Name, err)
+			return err
+		}
+	}
 	return nil
 }
