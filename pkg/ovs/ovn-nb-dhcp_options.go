@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/ovn-org/libovsdb/ovsdb"
@@ -117,7 +118,51 @@ func (c *OVNNbClient) updateDHCPv4Options(lsName, cidr, gateway, options string,
 		}
 
 		options = fmt.Sprintf("lease_time=%d,router=%s,server_id=%s,server_mac=%s,mtu=%d", 3600, gateway, "169.254.0.254", mac, mtu)
+	} else {
+		mac := util.GenerateMac()
+		if dhcpOpt != nil && len(dhcpOpt.Options) != 0 {
+			mac = dhcpOpt.Options["server_mac"]
+		}
+		newOptions := parseDHCPOptions(options)
+
+		for _, option := range necessaryV4DHCPOptions {
+			if _, ok := newOptions[option]; !ok {
+				switch option {
+				case "lease_time":
+					newOptions[option] = "3600"
+				case "router":
+					newOptions[option] = gateway
+				case "server_id":
+					newOptions[option] = "169.254.0.254"
+				case "server_mac":
+					newOptions[option] = mac
+				case "mtu":
+					newOptions[option] = strconv.Itoa(mtu)
+				}
+			}
+		}
+
+		var sb strings.Builder
+		first := true
+
+		for k, v := range newOptions {
+			if !first {
+				sb.WriteString(",")
+			}
+			sb.WriteString(k)
+			sb.WriteString("=")
+			if k == "dns_server" {
+				v = strings.ReplaceAll(v, ",", ";")
+				sb.WriteString(v)
+			} else {
+				sb.WriteString(v)
+			}
+			first = false
+		}
+		options = sb.String()
 	}
+
+	klog.Infof("options: %s", options)
 
 	/* update */
 	if dhcpOpt != nil {
@@ -132,6 +177,7 @@ func (c *OVNNbClient) updateDHCPv4Options(lsName, cidr, gateway, options string,
 			}
 		}
 		dhcpOpt.Options = newOptions
+		klog.Infof("exist dhcpOpt: %v", newOptions)
 		return dhcpOpt.UUID, c.updateDHCPOptions(dhcpOpt, &dhcpOpt.Cidr, &dhcpOpt.Options)
 	}
 
@@ -146,6 +192,7 @@ func (c *OVNNbClient) updateDHCPv4Options(lsName, cidr, gateway, options string,
 		klog.Error(err)
 		return "", err
 	}
+	klog.Infof("none exist dhcpOpt: %v", dhcpOpt.Options)
 
 	return dhcpOpt.UUID, nil
 }
