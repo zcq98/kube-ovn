@@ -11,6 +11,7 @@ import (
 	"github.com/ovn-org/libovsdb/ovsdb"
 	"github.com/stretchr/testify/require"
 
+	ovsclient "github.com/kubeovn/kube-ovn/pkg/ovsdb/client"
 	"github.com/kubeovn/kube-ovn/pkg/ovsdb/ovnnb"
 )
 
@@ -394,14 +395,15 @@ func (suite *OvnClientTestSuite) testLoadBalancerAddHealthCheck() {
 	t.Parallel()
 
 	nbClient := suite.ovnNBClient
-	lbName := "test-add-hc-lb"
-	vips := map[string]string{
-		"10.96.0.5:443":           "192.168.20.3:6443",
-		"10.107.43.241:8080":      "10.244.0.15:8080,10.244.0.16:8080,10.244.0.17:8080",
-		"[fd00:10:96::e86f]:8080": "[fc00::af4:a]:8080,[fc00::af4:b]:8080,[fc00::af4:c]:8080",
-	}
+
 	t.Run("add health check to load balancer",
 		func(t *testing.T) {
+			lbName := "test-add-hc-lb"
+			vips := map[string]string{
+				"10.96.0.5:443":           "192.168.20.3:6443",
+				"10.107.43.241:8080":      "10.244.0.15:8080,10.244.0.16:8080,10.244.0.17:8080",
+				"[fd00:10:96::e86f]:8080": "[fc00::af4:a]:8080,[fc00::af4:b]:8080,[fc00::af4:c]:8080",
+			}
 			// create load balancer
 			err := nbClient.CreateLoadBalancer(lbName, "tcp", "")
 			require.NoError(t, err)
@@ -425,6 +427,37 @@ func (suite *OvnClientTestSuite) testLoadBalancerAddHealthCheck() {
 				require.NoError(t, err)
 				require.NotNil(t, lb.HealthCheck)
 			}
+		},
+	)
+
+	t.Run("Create load balancer when multiple load balancer exist",
+		func(t *testing.T) {
+			lbName := "test-create-lb"
+			// create load balancer
+			lb1 := &ovnnb.LoadBalancer{
+				UUID:     ovsclient.NamedUUID(),
+				Name:     lbName,
+				Protocol: &ovnnb.LoadBalancerProtocolTCP,
+			}
+			ops, err := nbClient.ovsDbClient.Create(lb1)
+			require.NoError(t, err)
+			require.NotNil(t, ops)
+			err = nbClient.Transact("lb-add", ops)
+			require.NoError(t, err)
+
+			lb2 := &ovnnb.LoadBalancer{
+				UUID:     ovsclient.NamedUUID(),
+				Name:     lbName,
+				Protocol: &ovnnb.LoadBalancerProtocolTCP,
+			}
+			ops, err = nbClient.ovsDbClient.Create(lb2)
+			require.NoError(t, err)
+			require.NotNil(t, ops)
+			err = nbClient.Transact("lb-add", ops)
+			require.NoError(t, err)
+
+			err = nbClient.CreateLoadBalancer(lbName, "tcp", "")
+			require.ErrorContains(t, err, "more than one load balancer with same name")
 		},
 	)
 }
