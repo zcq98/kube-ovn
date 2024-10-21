@@ -514,6 +514,43 @@ func (suite *OvnClientTestSuite) testLoadBalancerDeleteVip() {
 	lb, err = nbClient.GetLoadBalancer(lbName, false)
 	require.NoError(t, err)
 	require.Equal(t, vips, lb.Vips)
+
+	err = nbClient.LoadBalancerAddHealthCheck(lbName, "10.107.43.239:8080", false, nil, nil)
+	require.NoError(t, err)
+
+	err = nbClient.LoadBalancerDeleteVip(lbName, "10.107.43.239:8080", false)
+	require.NoError(t, err)
+
+	// delete vip when lb.Vips is empty
+	err = nbClient.LoadBalancerDeleteVip(lbName, "10.107.43.239:8080", false)
+	require.NoError(t, err)
+
+	// delete vip when multiple load balancer exist
+	lbName = "test-delete-lb-vip"
+	lb1 := &ovnnb.LoadBalancer{
+		UUID:     ovsclient.NamedUUID(),
+		Name:     lbName,
+		Protocol: &ovnnb.LoadBalancerProtocolTCP,
+	}
+	ops, err := nbClient.ovsDbClient.Create(lb1)
+	require.NoError(t, err)
+	require.NotNil(t, ops)
+	err = nbClient.Transact("lb-add", ops)
+	require.NoError(t, err)
+
+	lb2 := &ovnnb.LoadBalancer{
+		UUID:     ovsclient.NamedUUID(),
+		Name:     lbName,
+		Protocol: &ovnnb.LoadBalancerProtocolTCP,
+	}
+	ops, err = nbClient.ovsDbClient.Create(lb2)
+	require.NoError(t, err)
+	require.NotNil(t, ops)
+	err = nbClient.Transact("lb-add", ops)
+	require.NoError(t, err)
+
+	err = nbClient.LoadBalancerDeleteVip(lbName, "10.107.43.239:8080", ignoreHealthCheck)
+	require.ErrorContains(t, err, "more than one load balancer with same name")
 }
 
 func (suite *OvnClientTestSuite) testLoadBalancerAddIPPortMapping() {
