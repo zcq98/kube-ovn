@@ -325,6 +325,37 @@ func (suite *OvnClientTestSuite) testSetLoadBalancerAffinityTimeout() {
 
 		require.Equal(t, lb.Options["affinity_timeout"], strconv.Itoa(expectedTimeout))
 	})
+
+	t.Run("set loadbalancer affinity timeout when multiple load balancer exist",
+		func(t *testing.T) {
+			lbName := "test-set-lb-affinity"
+			// create load balancer
+			lb1 := &ovnnb.LoadBalancer{
+				UUID:     ovsclient.NamedUUID(),
+				Name:     lbName,
+				Protocol: &ovnnb.LoadBalancerProtocolTCP,
+			}
+			ops, err := nbClient.ovsDbClient.Create(lb1)
+			require.NoError(t, err)
+			require.NotNil(t, ops)
+			err = nbClient.Transact("lb-add", ops)
+			require.NoError(t, err)
+
+			lb2 := &ovnnb.LoadBalancer{
+				UUID:     ovsclient.NamedUUID(),
+				Name:     lbName,
+				Protocol: &ovnnb.LoadBalancerProtocolTCP,
+			}
+			ops, err = nbClient.ovsDbClient.Create(lb2)
+			require.NoError(t, err)
+			require.NotNil(t, ops)
+			err = nbClient.Transact("lb-add", ops)
+			require.NoError(t, err)
+
+			err = nbClient.SetLoadBalancerAffinityTimeout(lbName, expectedTimeout)
+			require.ErrorContains(t, err, "more than one load balancer with same name")
+		},
+	)
 }
 
 func (suite *OvnClientTestSuite) testLoadBalancerAddVip() {
