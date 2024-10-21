@@ -388,6 +388,13 @@ func (suite *OvnClientTestSuite) testLoadBalancerAddVip() {
 			require.Equal(t, lb.Vips, expectedVips)
 		},
 	)
+
+	t.Run("add new vips to non-exist load balancer",
+		func(t *testing.T) {
+			err := nbClient.LoadBalancerAddVip("non-exist-lb", "10.96.0.2:443", "192.168.20.3:6443")
+			require.ErrorContains(t, err, "not found load balancer")
+		},
+	)
 }
 
 func (suite *OvnClientTestSuite) testLoadBalancerAddHealthCheck() {
